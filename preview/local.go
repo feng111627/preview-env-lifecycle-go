@@ -13,12 +13,14 @@ var ErrLocalProvision = errors.New("local provisioner: injected failure")
 type LocalProvisioner struct {
 	mu         sync.Mutex
 	namespaces map[string]bool
-	FailOn     map[string]error // 按环境名注入失败
+	sanitized  map[string]int // 每个环境被清理的次数
+	FailOn     map[string]error // 按环境名注入 Provision 失败
+	FailSanitizeOn map[string]error // 按环境名注入 Sanitize 失败
 }
 
 // NewLocalProvisioner 创建本地模拟器。
 func NewLocalProvisioner() *LocalProvisioner {
-	return &LocalProvisioner{namespaces: make(map[string]bool)}
+	return &LocalProvisioner{namespaces: make(map[string]bool), sanitized: make(map[string]int)}
 }
 
 // Provision 模拟创建命名空间；重名视为冲突失败。
@@ -41,6 +43,27 @@ func (l *LocalProvisioner) Destroy(_ context.Context, env *Env) error {
 	defer l.mu.Unlock()
 	delete(l.namespaces, env.Name)
 	return nil
+}
+
+// Sanitize 模拟就地清理命名空间（不增删资源），可注入失败。
+func (l *LocalProvisioner) Sanitize(_ context.Context, env *Env) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err, ok := l.FailSanitizeOn[env.Name]; ok {
+		return err
+	}
+	if !l.namespaces[env.Name] {
+		return errors.New("namespace does not exist")
+	}
+	l.sanitized[env.Name]++
+	return nil
+}
+
+// SanitizeCount 返回某环境被清理的次数，用于断言复用前确实清理过。
+func (l *LocalProvisioner) SanitizeCount(name string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.sanitized[name]
 }
 
 // NamespaceCount 返回当前存活的命名空间数，用于断言无泄漏。

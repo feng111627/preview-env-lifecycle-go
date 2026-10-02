@@ -7,9 +7,11 @@ import (
 	"time"
 )
 
-// Provisioner 模拟底层资源（命名空间）的创建与销毁。
+// Provisioner 模拟底层资源（命名空间）的创建、清理与销毁。
 type Provisioner interface {
 	Provision(ctx context.Context, env *Env) error
+	// Sanitize 在复用前把环境清理成对新使用者干净可用的状态。
+	Sanitize(ctx context.Context, env *Env) error
 	Destroy(ctx context.Context, env *Env) error
 }
 
@@ -22,6 +24,7 @@ type Manager struct {
 	ttl   time.Duration
 	prov  Provisioner
 	now   func() time.Time
+	seq   int // 自动命名计数器
 }
 
 // NewManager 创建一个生命周期管理器。
@@ -41,10 +44,25 @@ func active(s Status) bool {
 }
 
 // usageLocked 统计用户当前占用的活跃环境数（调用方须持锁）。
+// 已释放进共享池的环境不计入任何个人。
 func (m *Manager) usageLocked(user string) int {
 	n := 0
 	for _, e := range m.envs {
+		if e.Pooled {
+			continue
+		}
 		if active(e.Status) && (e.Owner == user || e.BoundTo == user) {
+			n++
+		}
+	}
+	return n
+}
+
+// globalActiveLocked 统计全局活跃环境总数，含共享池内的（调用方须持锁）。
+func (m *Manager) globalActiveLocked() int {
+	n := 0
+	for _, e := range m.envs {
+		if active(e.Status) {
 			n++
 		}
 	}
@@ -64,6 +82,10 @@ func (m *Manager) Create(ctx context.Context, name, owner string) (*Env, error) 
 	if m.quota.MaxEnvsPerUser > 0 && m.usageLocked(owner) >= m.quota.MaxEnvsPerUser {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: user %q reached limit %d", ErrQuotaExceeded, owner, m.quota.MaxEnvsPerUser)
+	}
+	if m.quota.MaxGlobalEnvs > 0 && m.globalActiveLocked() >= m.quota.MaxGlobalEnvs {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: global limit %d reached", ErrCapacityExhausted, m.quota.MaxGlobalEnvs)
 	}
 	now := m.now()
 	env := &Env{
@@ -203,6 +225,140 @@ func (m *Manager) Reap(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
+// Release 把空闲环境释放进共享池，供后续 Acquire 复用。
+// 仅所有者可释放；正被他人使用（绑定给别人）的环境不能腾挪。
+// 释放后环境不再计入任何个人配额，但仍计入全局容量。
+func (m *Manager) Release(name, requester string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	env, ok := m.envs[name]
+	if !ok || !active(env.Status) {
+		return fmt.Errorf("%w: %q", ErrNotFound, name)
+	}
+	if env.Pooled {
+		return nil // 幂等：已在池中
+	}
+	if env.Owner != requester {
+		return fmt.Errorf("%w: user %q is not the owner of %q", ErrPermissionDenied, requester, name)
+	}
+	if env.BoundTo != "" && env.BoundTo != requester {
+		return fmt.Errorf("%w: %q is in use by %q", ErrConflict, name, env.BoundTo)
+	}
+	env.Pooled = true
+	env.BoundTo = ""
+	env.Status = StatusReady
+	return nil
+}
+
+// takeFromPoolLocked 从共享池取一个可复用环境并认领（调用方须持锁）。
+// 认领期间置为 InUse，防止被并发 Acquire 重复拿走、被 Reap 回收或被原主销毁。
+func (m *Manager) takeFromPoolLocked(user string) (env *Env, prevOwner string) {
+	var pick *Env
+	for _, e := range m.envs {
+		if !e.Pooled || e.Status != StatusReady || e.BoundTo != "" {
+			continue
+		}
+		if pick == nil || e.Name < pick.Name { // 取名字最小者，保证结果可复现
+			pick = e
+		}
+	}
+	if pick == nil {
+		return nil, ""
+	}
+	prevOwner = pick.Owner
+	pick.Pooled = false
+	pick.Owner = user
+	pick.BoundTo = user
+	pick.Status = StatusInUse
+	return pick, prevOwner
+}
+
+// Acquire 为 user 申请一个环境：优先复用共享池中的空闲环境，
+// 池空时才新建。复用不增加全局占用，新建受全局容量上限约束。
+// 拿到手的环境已绑定给 user 并处于 InUse。
+func (m *Manager) Acquire(ctx context.Context, user string) (*Env, error) {
+	m.mu.Lock()
+	if m.quota.MaxEnvsPerUser > 0 && m.usageLocked(user) >= m.quota.MaxEnvsPerUser {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: user %q reached limit %d", ErrQuotaExceeded, user, m.quota.MaxEnvsPerUser)
+	}
+	if env, prevOwner := m.takeFromPoolLocked(user); env != nil {
+		m.mu.Unlock()
+		return m.finishReuse(env, prevOwner, user)
+	}
+	// 池空，走新建：检查全局容量后占位。
+	if m.quota.MaxGlobalEnvs > 0 && m.globalActiveLocked() >= m.quota.MaxGlobalEnvs {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: global limit %d reached", ErrCapacityExhausted, m.quota.MaxGlobalEnvs)
+	}
+	m.seq++
+	name := fmt.Sprintf("env-%s-%d", user, m.seq)
+	for m.envs[name] != nil { // 极端情况下与已有名字冲突时继续递增
+		m.seq++
+		name = fmt.Sprintf("env-%s-%d", user, m.seq)
+	}
+	now := m.now()
+	env := &Env{
+		Name:      name,
+		Owner:     user,
+		Status:    StatusProvisioning,
+		CreatedAt: now,
+		ExpiresAt: now.Add(m.ttl),
+		LastUsed:  now,
+	}
+	m.envs[name] = env
+	m.mu.Unlock()
+
+	if err := m.prov.Provision(ctx, env); err != nil {
+		m.mu.Lock()
+		if cur, ok := m.envs[name]; ok && cur == env {
+			env.Status = StatusFailed
+			env.FailReason = err
+			delete(m.envs, name)
+		}
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %v", ErrProvisionFailed, err)
+	}
+	m.mu.Lock()
+	if cur, ok := m.envs[name]; !ok || cur != env {
+		m.mu.Unlock()
+		_ = m.prov.Destroy(context.Background(), env)
+		return nil, fmt.Errorf("%w: environment was removed while provisioning", ErrConflict)
+	}
+	env.Status = StatusInUse
+	env.BoundTo = user
+	snap := *env
+	m.mu.Unlock()
+	return &snap, nil
+}
+
+// finishReuse 完成复用：锁外清理环境，失败则把认领补偿回池中。
+func (m *Manager) finishReuse(env *Env, prevOwner, user string) (*Env, error) {
+	if err := m.prov.Sanitize(context.Background(), env); err != nil {
+		m.mu.Lock()
+		// 补偿：撤销认领，占用记回原主，环境回到池中。
+		if cur, ok := m.envs[env.Name]; ok && cur == env {
+			env.Owner = prevOwner
+			env.BoundTo = ""
+			env.Status = StatusReady
+			env.Pooled = true
+		}
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %v", ErrReuseFailed, err)
+	}
+	m.mu.Lock()
+	if cur, ok := m.envs[env.Name]; !ok || cur != env {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: environment was removed while being reused", ErrConflict)
+	}
+	// 重新激活：续期，防止刚交付就被回收。
+	env.LastUsed = m.now()
+	env.ExpiresAt = env.LastUsed.Add(m.ttl)
+	snap := *env
+	m.mu.Unlock()
+	return &snap, nil
+}
+
 // Get 返回环境快照。
 func (m *Manager) Get(name string) (*Env, bool) {
 	m.mu.Lock()
@@ -220,4 +376,12 @@ func (m *Manager) Usage(user string) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.usageLocked(user)
+}
+
+// ActiveCount 返回全局活跃环境总数（含共享池内的），
+// 用于与底层实际资源数对账。
+func (m *Manager) ActiveCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.globalActiveLocked()
 }
