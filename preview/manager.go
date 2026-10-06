@@ -144,6 +144,9 @@ func (m *Manager) Destroy(ctx context.Context, name, requester string) error {
 
 // Bind 将环境绑定给使用者。所有者或其绑定人可使用；
 // 非所有者领取需通过配额校验，拒绝原因区分权限与配额。
+// 对已释放进共享池的环境：只有原主可以这样直接拿回自用，
+// 拿回时清除池内空闲标记、占用重新记到原主名下（受个人配额约束），
+// 之后与正常申请到的环境表现一致；其他人复用池内环境必须走 Acquire。
 func (m *Manager) Bind(name, user string) (*Env, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -154,17 +157,34 @@ func (m *Manager) Bind(name, user string) (*Env, error) {
 	if env.Status == StatusProvisioning {
 		return nil, fmt.Errorf("%w: %q is still provisioning", ErrConflict, name)
 	}
-	if env.BoundTo != "" && env.BoundTo != user {
-		return nil, fmt.Errorf("%w: %q is bound to %q", ErrPermissionDenied, name, env.BoundTo)
-	}
-	if env.Owner != user && env.BoundTo == "" {
-		// 非所有者领取他人环境：拒绝（环境是 owner 的私有资源）。
-		return nil, fmt.Errorf("%w: user %q does not own %q", ErrPermissionDenied, user, name)
-	}
-	// 已占用该环境的人（所有者或现绑定人）重复领取不计新配额。
-	alreadyOccupies := env.Owner == user || env.BoundTo == user
-	if m.quota.MaxEnvsPerUser > 0 && !alreadyOccupies && m.usageLocked(user) >= m.quota.MaxEnvsPerUser {
-		return nil, fmt.Errorf("%w: user %q reached limit %d", ErrQuotaExceeded, user, m.quota.MaxEnvsPerUser)
+	if env.Pooled {
+		// 环境在共享池里：只允许原主不经过申请直接拿回自用。
+		// 其他人要使用池内环境必须走 Acquire（含清理与占用交接），
+		// 不能靠 Bind 绕过复用流程；这里明确拒绝，不产生半交接状态。
+		if env.Owner != user {
+			return nil, fmt.Errorf("%w: pooled %q is held in the shared pool; Acquire is required to reuse it", ErrPermissionDenied, name)
+		}
+		// 原主拿回 = 正常投入使用：池内空闲标记清掉，占用重新记到本人名下。
+		// 池内环境此前不计个人配额，因此这里必须照常做个人配额判定，
+		// 个人额度用满返回 ErrQuotaExceeded（拿回不新增全局占用，与全局容量无关）。
+		if m.quota.MaxEnvsPerUser > 0 && m.usageLocked(user) >= m.quota.MaxEnvsPerUser {
+			return nil, fmt.Errorf("%w: user %q reached limit %d taking back pooled %q", ErrQuotaExceeded, user, m.quota.MaxEnvsPerUser, name)
+		}
+		env.Pooled = false
+		env.Owner = user
+	} else {
+		if env.BoundTo != "" && env.BoundTo != user {
+			return nil, fmt.Errorf("%w: %q is bound to %q", ErrPermissionDenied, name, env.BoundTo)
+		}
+		if env.Owner != user && env.BoundTo == "" {
+			// 非所有者领取他人环境：拒绝（环境是 owner 的私有资源）。
+			return nil, fmt.Errorf("%w: user %q does not own %q", ErrPermissionDenied, user, name)
+		}
+		// 已占用该环境的人（所有者或现绑定人）重复领取不计新配额。
+		alreadyOccupies := env.Owner == user || env.BoundTo == user
+		if m.quota.MaxEnvsPerUser > 0 && !alreadyOccupies && m.usageLocked(user) >= m.quota.MaxEnvsPerUser {
+			return nil, fmt.Errorf("%w: user %q reached limit %d", ErrQuotaExceeded, user, m.quota.MaxEnvsPerUser)
+		}
 	}
 	env.BoundTo = user
 	env.Status = StatusInUse
